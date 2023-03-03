@@ -15,7 +15,7 @@ use rocket::{
 };
 use rocket_db_pools::Connection;
 use serde::{Deserialize, Serialize};
-use sqlx::{postgres::PgRow, types::Uuid, Row};
+use sqlx::{postgres::PgRow, types::Uuid, Acquire, Row};
 use web_push::{
     ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushClient, WebPushMessageBuilder,
     URL_SAFE_NO_PAD,
@@ -380,16 +380,20 @@ pub async fn advance_game(
     game_id: &str,
     data: Json<AdvanceGameData>,
 ) -> Result<NoContent> {
-    sqlx::query(
-        "update participations
-        set lives = lives + ($1)
-        where game_id = $2 and player_id = $3",
-    )
-    .bind(data.result)
-    .bind(game_id)
-    .bind(data.player_id)
-    .execute(&mut *db)
-    .await?;
+    let game = sqlx::query("select * from games where id = $1")
+        .bind(game_id)
+        .map(|r: PgRow| DbGame {
+            name: r.get("name"),
+            started: r.get("started"),
+            next_player: r.get("next_player"),
+        })
+        .fetch_one(&mut *db)
+        .await?;
+
+    if !game.started || game.next_player.is_none() || game.next_player.unwrap() != data.player_id {
+        // protect against double advancing
+        return Ok(NoContent);
+    }
 
     let participations = sqlx::query(
         "select
@@ -449,6 +453,19 @@ pub async fn advance_game(
         }
     }
 
+    let mut transaction = db.begin().await?;
+
+    sqlx::query(
+        "update participations
+        set lives = lives + ($1)
+        where game_id = $2 and player_id = $3",
+    )
+    .bind(data.result)
+    .bind(game_id)
+    .bind(data.player_id)
+    .execute(&mut transaction)
+    .await?;
+
     sqlx::query(
         "update games g
         set next_player = $2
@@ -456,8 +473,10 @@ pub async fn advance_game(
     )
     .bind(game_id)
     .bind(next.player_id)
-    .execute(&mut *db)
+    .execute(&mut transaction)
     .await?;
+
+    transaction.commit().await?;
 
     let _ = queue.send(game_id.to_string());
 
